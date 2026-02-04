@@ -1,0 +1,367 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI 机器人灵巧手同步系统</title>
+    <!-- 引入 Tailwind CSS 进行 UI 布局 -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- 引入 Three.js -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <!-- 引入 MediaPipe Hands -->
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #0f172a; color: white; }
+        .view-label {
+            position: absolute;
+            top: 8px;
+            left: 8px;
+            background: rgba(0,0,0,0.6);
+            padding: 2px 8px;
+            border-radius: 4px;
+            font-size: 12px;
+            pointer-events: none;
+            border: 1px solid rgba(255,255,255,0.2);
+        }
+        #video-container {
+            position: absolute;
+            bottom: 20px;
+            right: 20px;
+            width: 240px;
+            height: 180px;
+            border: 2px solid #3b82f6;
+            border-radius: 8px;
+            overflow: hidden;
+            z-index: 100;
+            background: #000;
+        }
+        #input-video {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            transform: scaleX(-1);
+        }
+        canvas { display: block; }
+        .grid-container {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            grid-template-rows: 1fr 1fr;
+            height: 100vh;
+            width: 100vw;
+            gap: 2px;
+            background: #1e293b;
+        }
+        .view-pane {
+            position: relative;
+            background: #0f172a;
+            overflow: hidden;
+        }
+        #status-indicator {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            z-index: 200;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        .dot { height: 12px; width: 12px; border-radius: 50%; display: inline-block; }
+        .dot-red { background-color: #ef4444; }
+        .dot-green { background-color: #22c55e; }
+    </style>
+</head>
+<body>
+
+    <div id="status-indicator" class="bg-black/40 backdrop-blur-md p-3 rounded-xl border border-white/10">
+        <span id="status-dot" class="dot dot-red"></span>
+        <span id="status-text" class="font-mono text-sm">正在启动摄像头...</span>
+    </div>
+
+    <div class="grid-container">
+        <div id="view-top" class="view-pane"><div class="view-label">顶视图 (Top)</div></div>
+        <div id="view-front" class="view-pane"><div class="view-label">前视图 (Front)</div></div>
+        <div id="view-side" class="view-pane"><div class="view-label">侧视图 (Side)</div></div>
+        <div id="view-persp" class="view-pane"><div class="view-label">自由透视 (Perspective - 拖动旋转)</div></div>
+    </div>
+
+    <div id="video-container">
+        <video id="input-video" playsinline></video>
+    </div>
+
+<script>
+/**
+ * 机器人灵巧手同步控制系统
+ * 功能：通过 MediaPipe 捕捉手势关键点，实时驱动 Three.js 机械手模型
+ */
+
+let scene, cameras = {}, renderers = {}, handModel = {};
+const videoElement = document.getElementById('input-video');
+const statusDot = document.getElementById('status-dot');
+const statusText = document.getElementById('status-text');
+
+// 关键点映射关系 (MediaPipe index -> 机械手关节)
+const FINGER_MAP = {
+    thumb: [1, 2, 3, 4],
+    index: [5, 6, 7, 8],
+    middle: [9, 10, 11, 12],
+    ring: [13, 14, 15, 16],
+    pinky: [17, 18, 19, 20]
+};
+
+// 初始化 Three.js 环境
+function initScene() {
+    scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x0f172a);
+
+    // 灯光
+    const ambientLight = new THREE.AmbientLight(0xffffff, 0.5);
+    scene.add(ambientLight);
+    const directionalLight = new THREE.DirectionalLight(0xffffff, 0.8);
+    directionalLight.position.set(5, 10, 7);
+    scene.add(directionalLight);
+
+    // 网格辅助
+    const grid = new THREE.GridHelper(20, 20, 0x334155, 0x1e293b);
+    grid.position.y = -5;
+    scene.add(grid);
+
+    // 初始化四个渲染器和相机
+    const views = ['top', 'front', 'side', 'persp'];
+    views.forEach(v => {
+        const container = document.getElementById(`view-${v}`);
+        const rect = container.getBoundingClientRect();
+        
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(rect.width, rect.height);
+        renderer.setPixelRatio(window.devicePixelRatio);
+        container.appendChild(renderer.domElement);
+        renderers[v] = renderer;
+
+        let camera;
+        const aspect = rect.width / rect.height;
+        const d = 10;
+
+        if (v === 'top') {
+            camera = new THREE.OrthographicCamera(-d * aspect, d * aspect, d, -d, 1, 100);
+            camera.position.set(0, 20, 0);
+            camera.lookAt(0, 0, 0);
+        } else if (v === 'front') {
+            camera = new THREE.OrthographicCamera(-d * aspect, d * aspect, d, -d, 1, 100);
+            camera.position.set(0, 0, 20);
+            camera.lookAt(0, 0, 0);
+        } else if (v === 'side') {
+            camera = new THREE.OrthographicCamera(-d * aspect, d * aspect, d, -d, 1, 100);
+            camera.position.set(20, 0, 0);
+            camera.lookAt(0, 0, 0);
+        } else {
+            camera = new THREE.PerspectiveCamera(45, aspect, 0.1, 1000);
+            camera.position.set(15, 15, 20);
+            camera.lookAt(0, 0, 0);
+        }
+        cameras[v] = camera;
+    });
+
+    createHandModel();
+    animate();
+}
+
+// 创建机器人灵巧手模型
+function createHandModel() {
+    const material = new THREE.MeshStandardMaterial({ 
+        color: 0x94a3b8, 
+        metalness: 0.8, 
+        roughness: 0.2,
+        flatShading: false
+    });
+    const jointMaterial = new THREE.MeshStandardMaterial({ color: 0x3b82f6 });
+
+    // 手掌
+    const palmGeom = new THREE.BoxGeometry(4, 1, 4.5);
+    const palm = new THREE.Mesh(palmGeom, material);
+    scene.add(palm);
+    handModel.palm = palm;
+
+    const fingerNames = ['thumb', 'index', 'middle', 'ring', 'pinky'];
+    const fingerOffsets = [
+        { x: -2.2, z: 1.5, rotY: Math.PI/4 }, // thumb
+        { x: -1.5, z: -2.2, rotY: 0 },         // index
+        { x: -0.5, z: -2.3, rotY: 0 },         // middle
+        { x: 0.5, z: -2.2, rotY: 0 },          // ring
+        { x: 1.5, z: -2.0, rotY: 0 }           // pinky
+    ];
+
+    handModel.fingers = {};
+
+    fingerNames.forEach((name, idx) => {
+        const bones = [];
+        let parent = palm;
+        const offset = fingerOffsets[idx];
+
+        // 每个手指3个关节（拇指特殊处理）
+        const segmentCount = 3;
+        for (let s = 0; s < segmentCount; s++) {
+            const group = new THREE.Group();
+            
+            // 初始位置
+            if (s === 0) {
+                group.position.set(offset.x, 0, offset.z);
+                group.rotation.y = offset.rotY;
+            } else {
+                group.position.z = -1.2; // 向指尖延伸
+            }
+
+            // 关节球
+            const joint = new THREE.Mesh(new THREE.SphereGeometry(0.35), jointMaterial);
+            group.add(joint);
+
+            // 指节骨骼
+            const boneLen = (name === 'thumb') ? 1.0 : (1.4 - s * 0.2);
+            const boneGeom = new THREE.CylinderGeometry(0.25, 0.3, boneLen, 8);
+            boneGeom.rotateX(Math.PI/2);
+            const bone = new THREE.Mesh(boneGeom, material);
+            bone.position.z = -boneLen/2;
+            group.add(bone);
+
+            parent.add(group);
+            bones.push(group);
+            parent = group;
+        }
+        handModel.fingers[name] = bones;
+    });
+}
+
+// 处理 MediaPipe 返回的结果
+function onResults(results) {
+    if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+        statusDot.className = "dot dot-green";
+        statusText.innerText = "手势追踪中...";
+        
+        const landmarks = results.multiHandLandmarks[0];
+        updateHandRotation(landmarks);
+    } else {
+        statusDot.className = "dot dot-red";
+        statusText.innerText = "等待手势...";
+    }
+}
+
+// 将 21 个关键点数据映射到 3D 模型旋转
+function updateHandRotation(landmarks) {
+    // 整体旋转计算 (基于手掌 0, 5, 17 号点)
+    const p0 = landmarks[0];
+    const p5 = landmarks[5];
+    const p17 = landmarks[17];
+
+    // 简单模拟手掌倾斜
+    handModel.palm.rotation.z = Math.atan2(p17.y - p5.y, p17.x - p5.x);
+    handModel.palm.rotation.x = (p0.z) * 5; // 深度感
+
+    const fingers = ['thumb', 'index', 'middle', 'ring', 'pinky'];
+    
+    fingers.forEach(name => {
+        const indices = FINGER_MAP[name];
+        const bones = handModel.fingers[name];
+
+        for (let i = 0; i < 2; i++) {
+            const m0 = landmarks[indices[i]];
+            const m1 = landmarks[indices[i+1]];
+            const m2 = landmarks[indices[i+2]];
+
+            // 计算相邻三点之间的夹角（简化版弯曲度算法）
+            const v1 = new THREE.Vector3(m0.x - m1.x, m0.y - m1.y, m0.z - m1.z);
+            const v2 = new THREE.Vector3(m2.x - m1.x, m2.y - m1.y, m2.z - m1.z);
+            
+            let angle = v1.angleTo(v2);
+            
+            // 映射到合理的机械关节旋转范围 (0 到 1.5 弧度)
+            let rotation = Math.max(0, Math.PI - angle);
+            
+            // 平滑应用旋转
+            bones[i].rotation.x = -rotation * 1.2;
+            
+            // 根部关节额外添加左右摆动（外展/内收）
+            if (i === 0 && name !== 'thumb') {
+                const spread = (m1.x - landmarks[0].x) * 2;
+                bones[i].rotation.y = spread;
+            }
+        }
+    });
+}
+
+// 渲染循环
+function animate() {
+    requestAnimationFrame(animate);
+    
+    // 自由视角相机自动微旋（如果没有手部动作时）
+    cameras.persp.position.x = 15 * Math.cos(Date.now() * 0.0002);
+    cameras.persp.position.z = 15 * Math.sin(Date.now() * 0.0002);
+    cameras.persp.lookAt(0, 0, 0);
+
+    Object.keys(renderers).forEach(v => {
+        renderers[v].render(scene, cameras[v]);
+    });
+}
+
+// 初始化 MediaPipe
+async function setupMediaPipe() {
+    const hands = new Hands({
+        locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+    });
+
+    hands.setOptions({
+        maxNumHands: 1,
+        modelComplexity: 1,
+        minDetectionConfidence: 0.7,
+        minTrackingConfidence: 0.7
+    });
+
+    hands.onResults(onResults);
+
+    const camera = new Camera(videoElement, {
+        onFrame: async () => {
+            await hands.send({ image: videoElement });
+        },
+        width: 640,
+        height: 480
+    });
+
+    try {
+        await camera.start();
+    } catch (e) {
+        statusText.innerText = "错误: 无法访问摄像头";
+        console.error(e);
+    }
+}
+
+// 窗口大小适配
+window.addEventListener('resize', () => {
+    const views = ['top', 'front', 'side', 'persp'];
+    views.forEach(v => {
+        const container = document.getElementById(`view-${v}`);
+        const rect = container.getBoundingClientRect();
+        const aspect = rect.width / rect.height;
+        
+        renderers[v].setSize(rect.width, rect.height);
+        
+        if (cameras[v].isOrthographicCamera) {
+            const d = 10;
+            cameras[v].left = -d * aspect;
+            cameras[v].right = d * aspect;
+            cameras[v].top = d;
+            cameras[v].bottom = -d;
+        } else {
+            cameras[v].aspect = aspect;
+        }
+        cameras[v].updateProjectionMatrix();
+    });
+});
+
+// 启动程序
+window.onload = () => {
+    initScene();
+    setupMediaPipe();
+};
+</script>
+</body>
+</html>
